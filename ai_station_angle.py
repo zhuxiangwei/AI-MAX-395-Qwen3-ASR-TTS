@@ -87,14 +87,86 @@ SAMPLE_WIDTH = 2
 FRAME_MS = 30
 FRAME_SAMPLES = int(RATE * FRAME_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * CHANNELS * SAMPLE_WIDTH
-SILENCE_THRESHOLD = 1000
-SILENCE_DURATION = 1.5
+SILENCE_THRESHOLD = 2500
+VAD_CONSEC_FRAMES = 5  # 需要连续 N 帧超过阈值才算语音开始（过滤偶发尖峰噪音）
+SILENCE_DURATION_WAKE = 2.5   # 唤醒词录音：短停顿即截断（唤醒词本身短）
+SILENCE_DURATION_CMD = 4.0     # 指令录音：长停顿才截断（支持多句话一次说完）
+SILENCE_DURATION = SILENCE_DURATION_WAKE  # 默认用唤醒词阈值
 PRE_SPEECH_BUFFER = 0.3
 MAX_RECORD_SECONDS = 30
 MIN_SPEECH_SECONDS = 0.3
 LISTEN_TIMEOUT = 60
 WARMUP_FRAMES = 10
 OUTPUT_DIR = Path("/tmp/voice_assistant")
+
+# --- 简短回复预录音（随机选一个播放）---
+QUICK_REPLY_FILES = [
+    Path(__file__).parent / "assets" / "quick_reply_0.wav",
+    Path(__file__).parent / "assets" / "quick_reply_1.wav",
+    Path(__file__).parent / "assets" / "quick_reply_2.wav",
+    Path(__file__).parent / "assets" / "quick_reply_3.wav",
+]
+
+
+_quick_reply_last_time = 0  # 上次播放 quick_reply 的时间戳
+QUICK_REPLY_COOLDOWN = 60  # 冷却秒数，避免反复触发
+
+
+def _play_quick_reply():
+    """播放随机简短回复 WAV（带冷却，找不到不播）。"""
+    global _quick_reply_last_time
+    now = time.time()
+    if now - _quick_reply_last_time < QUICK_REPLY_COOLDOWN:
+        return  # 冷却中，静默跳过
+    available = [f for f in QUICK_REPLY_FILES if f.exists()]
+    if not available:
+        print("[VA] quick_reply WAV 文件全部不存在，跳过")
+        return
+    chosen = random.choice(available)
+    print(f"[VA] 播放 quick_reply: {chosen.name}")
+    _quick_reply_last_time = now
+    _play_wav_sync(chosen)
+    time.sleep(6)
+
+
+def _tts_speak_now(text, extra_delay=0):
+    """同步 TTS：直接调 TTS 服务，等播完才返回。
+    语音助手所有播报统一用这个，不再走异步队列。
+    extra_delay：播完后额外等待秒数，防止扬声器回声。
+    """
+    est_duration = estimate_audio_duration(text)
+    payload = _build_tts_payload(text)
+    wav_path = None
+    _tts_playing.set()
+    try:
+        tts_timeout = max(int(est_duration * 5) + 30, HTTP_TIMEOUT)
+        conn = http.client.HTTPConnection(TTS_HOST, TTS_PORT, timeout=tts_timeout)
+        conn.request("POST", "/v1/tts", body=payload,
+                      headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            print(f"[TTS] HTTP {resp.status}: {resp.read()[:200]}")
+            return
+        wav_data = resp.read()
+        conn.close()
+        if not wav_data or len(wav_data) < 44:
+            print(f"[TTS] 返回数据过短: {len(wav_data)} bytes")
+            return
+        wav_path = f"/tmp/tts_va_{int(time.time()*1000)}.wav"
+        with open(wav_path, "wb") as f:
+            f.write(wav_data)
+        print(f'[TTS] 同步播报: {text[:30]}... (估时 {est_duration:.1f}s)')
+        subprocess.run(
+            ["aplay", "-q", "-D", "default", wav_path],
+            check=True, capture_output=True,
+            timeout=int(est_duration * 2 + 30),
+        )
+    except Exception as e:
+        print(f"[TTS] 同步播报失败: {e}")
+    finally:
+        _tts_playing.clear()
+        if wav_path and os.path.exists(wav_path):
+            os.remove(wav_path)
 
 # --- 唤醒词 ---
 WAKE_PATTERNS = [
@@ -104,20 +176,29 @@ WAKE_PATTERNS = [
     r"小智你好",
 ]
 WAKE_REGEX = re.compile("|".join(WAKE_PATTERNS))
-WAKE_REPLY = "我是宇宙超级智多星，小智在此等候多时了！"
+WAKE_REPLY = "我是宇宙超级智多星，小智在此等候多时了！想问什么你说"
 COMMAND_TIMEOUT = 15
 
 # --- LLM ---
 ROUTER_HOST = "127.0.0.1"
 ROUTER_PORT = 12345
 ROUTER_API_KEY = "71769f2CeCE681015e1B71eCf848900e"
-LLM_MODEL = "358"
+LLM_MODEL = "Qwen3.6-35B-A3B-APEX-MTP-I-Balanced"
 MAX_TOOL_ROUNDS = 5
 
 # --- ASR ---
 ASR_URL = "http://127.0.0.1:12347/v1/audio/transcriptions"
 ASR_MODEL = "Qwen3-ASR-1.7B"
 ASR_TIMEOUT = 60
+ASR_LANGUAGE = "chinese"
+ASR_PROMPT = "以下是普通话的语音转文字结果。"
+
+# ASR 无效输出过滤（llama.cpp 默认 prompt 回声等）
+_ASR_INVALID_PATTERNS = [
+    "transcribe audio to text",
+    "transcribe audio a texto",
+    "transcribe audio",
+]
 
 # --- 正则 ---
 ALERT_KEYWORDS = [
@@ -131,7 +212,6 @@ ALERT_KEYWORDS = [
 ]
 TASK_LAUNCH_RE = re.compile(r'launch_slot_.*?task\s+(\d+)')
 TASK_RELEASE_RE = re.compile(r'release:.*?task\s+(\d+).*?n_tokens\s*=\s*(\d+)')
-TASK_PREFILL_RE = re.compile(r'print_timing.*?task\s+(\d+).*?prompt eval time\s*=[\d.]+\s*ms\s*/\s*(\d+)\s*tokens')
 TASK_GEN_RE = re.compile(r'print_timing.*?task\s+(\d+).*?n_decoded\s*=\s*(\d+).*?tg\s*=.*?([\\d.]+)')
 TASK_IDLE_RE = re.compile(r'all slots are idle')
 MODEL_PROXY_RE = re.compile(r'proxying request to model\s+(.+?)\s+on port\s+(\d+)')
@@ -149,6 +229,7 @@ HW_TEMP_LOG_RE = re.compile(
 # --- 全局状态 ---
 _stop_event = threading.Event()
 _tts_playing = threading.Event()  # TTS 正在播放时置位
+_voice_busy = threading.Event()  # 语音助手链路进行中（唤醒→回复→录指令→LLM→TTS+3s）
 
 
 def _handle_sigterm(signum, frame):
@@ -330,6 +411,10 @@ class TTSQueue:
         self._worker.start()
 
     def put(self, text, priority=0, tag=""):
+        # 语音助手链路进行中时，丢弃所有监控播报（不打断对话）
+        if _voice_busy.is_set():
+            logging.info(f'[Queue] 丢弃: "{text[:40]}" (语音助手占用)')
+            return
         with self._lock:
             if len(self._queue) >= TTS_QUEUE_MAX:
                 logging.info(f'[Queue] 丢弃: "{text[:40]}" (队列已满)')
@@ -390,6 +475,10 @@ class TTSQueue:
             with open(wav_path, "wb") as f:
                 f.write(wav_data)
             logging.info(f"[TTS] 生成完成: {len(wav_data)} bytes, {time.time()-t0:.1f}s")
+            # 语音助手链路进行中，TTS 生成完也不播放（丢弃）
+            if _voice_busy.is_set():
+                logging.info(f"[TTS] 丢弃已生成 TTS（语音助手占用）")
+                return
             # 播放 — 置位 playing 标志，语音助手会等待
             _tts_playing.set()
             aplay = subprocess.Popen(
@@ -602,22 +691,42 @@ class MicRecorder:
         print(f"[VAD] 噪声: avg={avg:.0f} max={mx:.0f} → 建议阈值: {suggested}")
         return suggested
 
-    def record_once(self, proc=None):
+    def record_once(self, proc=None, silence_duration=None):
+        """录音一段。
+        
+        silence_duration: 可选，覆盖默认静音时长。
+        唤醒词用 2.5s，指令用 4.0s。
+        """
         own_proc = proc is None
         if own_proc:
             proc = self._start_arecord()
             self._warmup(proc)
-        print(f"[Mic] 监听中 (threshold={self.silence_threshold})...")
+        sd = silence_duration if silence_duration is not None else self.silence_duration
+        silence_limit = int(sd * 1000 / FRAME_MS)
+        print(f"[Mic] 监听中 (threshold={self.silence_threshold}, silence={sd}s)...")
         pre_buffer = []
         pre_buffer_size = int(PRE_SPEECH_BUFFER * 1000 / FRAME_MS)
         frames = []
         is_speaking = False
         silence_frames = 0
-        silence_limit = int(self.silence_duration * 1000 / FRAME_MS)
         max_frames = int(self.max_record * 1000 / FRAME_MS)
         start_time = time.time()
         try:
             while True:
+                # 监控 TTS 正在播放时不录音（避免录到播报声）
+                if _tts_playing.is_set():
+                    if is_speaking:
+                        print("[Mic] TTS 播放中断录音")
+                        return None
+                    # 还没开始说话，直接跳过这一帧
+                    chunk = self._read_frame(proc)
+                    if chunk is None:
+                        break
+                    rms = compute_rms(chunk)
+                    pre_buffer.append(chunk)
+                    if len(pre_buffer) > pre_buffer_size:
+                        pre_buffer.pop(0)
+                    continue
                 if not is_speaking and self.listen_timeout > 0:
                     if time.time() - start_time > self.listen_timeout:
                         print("[Mic] 监听超时")
@@ -631,11 +740,22 @@ class MicRecorder:
                     if len(pre_buffer) > pre_buffer_size:
                         pre_buffer.pop(0)
                     if rms > self.silence_threshold:
-                        is_speaking = True
-                        frames.extend(pre_buffer)
-                        frames.append(chunk)
-                        print(f"[VAD] 语音开始 (rms={rms:.0f})")
-                        silence_frames = 0
+                        # 需要连续 VAD_CONSEC_FRAMES 帧超过阈值才算语音开始（过滤偶发尖峰）
+                        consec = 1  # 当前帧
+                        for c in pre_buffer[-(VAD_CONSEC_FRAMES-1):]:
+                            if compute_rms(c) > self.silence_threshold:
+                                consec += 1
+                            else:
+                                break
+                        if consec >= VAD_CONSEC_FRAMES:
+                            is_speaking = True
+                            frames.extend(pre_buffer)
+                            frames.append(chunk)
+                            print(f"[VAD] 语音开始 (rms={rms:.0f})")
+                            silence_frames = 0
+                    else:
+                        # 不连续，重置
+                        pass
                 else:
                     frames.append(chunk)
                     if rms < self.silence_threshold:
@@ -679,7 +799,11 @@ def transcribe(wav_path):
             resp = requests.post(
                 ASR_URL,
                 files={"file": ("audio.wav", f, "audio/wav")},
-                data={"model": ASR_MODEL},
+                data={
+                    "model": ASR_MODEL,
+                    "language": ASR_LANGUAGE,
+                    "prompt": ASR_PROMPT,
+                },
                 timeout=ASR_TIMEOUT,
             )
     except requests.exceptions.RequestException as e:
@@ -695,6 +819,11 @@ def transcribe(wav_path):
         text = match.group(1).strip()
     else:
         text = re.sub(r"^language\s+\w+\s*", "", raw_text).strip()
+    text_lower = text.lower().strip()
+    for bad in _ASR_INVALID_PATTERNS:
+        if bad in text_lower:
+            print(f"[ASR] 丢弃无效输出: {text}")
+            return None
     print(f"[ASR] 识别: {text}")
     return text if text else None
 
@@ -708,7 +837,8 @@ SYSTEM_PROMPT = """你是一个简洁的语音助手。回答要求：
 2. 不要使用 markdown、表格、代码块等格式
 3. 不要说"作为AI"之类的套话
 4. 像和朋友聊天一样自然
-5. 如果工具返回了数据，基于数据给出自然简洁的回答，不要复述原始数据格式"""
+5. 如果工具返回了数据，基于数据给出自然简洁的回答，不要复述原始数据格式
+6. 必须用中文回答，无论提问语言是什么"""
 
 # 工具定义
 TOOLS = [
@@ -933,17 +1063,30 @@ def prewarm():
             status = None
             for m in data.get("data", []):
                 mid = m.get("id", "")
-                if "35B-A3B" in mid or "358" in mid:
+                aliases = [a for a in m.get("aliases", [])]
+                if LLM_MODEL in aliases or LLM_MODEL == mid:
                     status = m["status"]["value"]
                     break
             if status == "loaded":
-                print("[LLM] 358 已就绪")
+                print(f"[LLM] {LLM_MODEL} 已就绪")
                 _prewarm_done = True
                 return
-            print(f"[LLM] 358 状态={status}，触发加载...")
+            print(f"[LLM] {LLM_MODEL} 状态={status}，触发加载...")
+            # 找对应模型的完整 ID
+            target_model = None
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                aliases = [a for a in m.get("aliases", [])]
+                if LLM_MODEL in aliases or LLM_MODEL == mid:
+                    target_model = mid
+                    break
+            if target_model is None:
+                print(f"[LLM] 未找到模型 {LLM_MODEL}，跳过预热")
+                _prewarm_done = True
+                return
             conn = http.client.HTTPConnection(ROUTER_HOST, ROUTER_PORT, timeout=10)
             conn.request("POST", "/models/load",
-                body=json.dumps({"model": "Qwen3.6-35B-A3B-UD-Q8_K_XL"}),
+                body=json.dumps({"model": target_model}),
                 headers={"Authorization": f"Bearer {ROUTER_API_KEY}",
                          "Content-Type": "application/json"})
             resp = conn.getresponse()
@@ -959,13 +1102,15 @@ def prewarm():
                 data = json.loads(resp.read().decode())
                 conn.close()
                 for m in data.get("data", []):
-                    if "35B-A3B" in m.get("id", ""):
+                    mid = m.get("id", "")
+                    aliases = [a for a in m.get("aliases", [])]
+                    if LLM_MODEL in aliases or LLM_MODEL == mid:
                         if m["status"]["value"] == "loaded":
-                            print("[LLM] 358 加载完成")
+                            print(f"[LLM] {LLM_MODEL} 加载完成")
                             _prewarm_done = True
                             return
                         break
-            print("[LLM] 358 加载超时")
+            print(f"[LLM] {LLM_MODEL} 加载超时")
         except Exception as e:
             print(f"[LLM] 预热失败: {e}")
         _prewarm_done = True
@@ -975,7 +1120,7 @@ def prewarm():
 
 def chat(user_text, history=None):
     if _prewarm_thread and not _prewarm_done:
-        print("[LLM] 等待 358 唤醒完成...")
+        print(f"[LLM] 等待 {LLM_MODEL} 唤醒完成...")
         _prewarm_thread.join(timeout=120)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
@@ -986,8 +1131,9 @@ def chat(user_text, history=None):
         try:
             response = _client.chat.completions.create(
                 model=LLM_MODEL, messages=messages,
-                temperature=0.6, top_p=0.95, max_tokens=1024,
+                temperature=0.3, top_p=0.95, max_tokens=1024,
                 tools=TOOLS,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
         except Exception as e:
             print(f"[LLM] 请求失败: {e}")
@@ -1040,6 +1186,7 @@ def extract_command(text):
 class MonitorState:
     def __init__(self):
         self.router_offset = 0
+        self.router_error_offset = 0
         self.hw_temp_offset = 0
         self.last_alert_time = 0
         self.last_daily_broadcast = 0
@@ -1055,6 +1202,7 @@ class MonitorState:
                 with open(STATE_FILE) as f:
                     data = json.load(f)
                 self.router_offset = data.get("router_offset", 0)
+                self.router_error_offset = data.get("router_error_offset", 0)
                 self.hw_temp_offset = data.get("hw_temp_offset", 0)
                 self.last_alert_time = data.get("last_alert_time", 0)
                 self.last_daily_broadcast = data.get("last_daily_broadcast", 0)
@@ -1070,6 +1218,7 @@ class MonitorState:
             with open(tmp, "w") as f:
                 json.dump({
                     "router_offset": self.router_offset,
+                    "router_error_offset": self.router_error_offset,
                     "hw_temp_offset": self.hw_temp_offset,
                     "last_alert_time": self.last_alert_time,
                     "last_daily_broadcast": self.last_daily_broadcast,
@@ -1213,14 +1362,15 @@ def _check_router_errors(state, tts_queue):
         size = ROUTER_LOG.stat().st_size
     except Exception:
         return
-    if size < state.router_offset:
-        state.router_offset = 0
-    if size == state.router_offset:
+    if size < state.router_error_offset:
+        state.router_error_offset = 0
+    if size == state.router_error_offset:
         return
     try:
         with open(ROUTER_LOG, "r") as f:
-            f.seek(state.router_offset)
+            f.seek(state.router_error_offset)
             new_lines = f.readlines()
+            state.router_error_offset = f.tell()
     except Exception:
         return
     for line in new_lines:
@@ -1274,9 +1424,30 @@ def _alert(tts_queue, state, alert_type, severity, text):
 # 语音助手
 # ============================================================
 
+SESSION_TIMEOUT = 30  # 每次监听超时秒数
+
 def run_voice_assistant(tts_queue):
-    """语音助手主循环。"""
-    recorder = MicRecorder()
+    """语音助手主循环。
+
+    两个业务：语音助手（VA）和监控播报。VA 优先。
+    VA 会话期间 _voice_busy 置位，监控播报全部丢弃。
+
+    状态机：
+    [初始监听] VAD 运行 → 录音 → ASR → 唤醒词？
+      ├─ 否 → quick_reply → 回到初始监听
+      └─ 是 → 置位 _voice_busy（VAD 暂停、播报暂停）
+              → 播放唤醒回复 → 等 3s
+              → 进入会话循环：
+                  [监听] VAD 录音（30s 超时）→ ASR
+                    ├─ 超时（无声音）→ "再见" → 清 _voice_busy → 回到初始监听
+                    ├─ ASR 为空 → "没听清，请再说一遍" → 等 3s → 回到 [监听]
+                    └─ 有内容 → 暂停 VAD → LLM → TTS 播报 → 等 3s → 回到 [监听]
+    """
+    recorder = MicRecorder(listen_timeout=0)  # 初始监听：无超时，一直等唤醒词
+    session_recorder = MicRecorder(
+        silence_duration=SILENCE_DURATION_CMD,
+        listen_timeout=SESSION_TIMEOUT,
+    )
     history = []
 
     print("=" * 50)
@@ -1286,74 +1457,108 @@ def run_voice_assistant(tts_queue):
     print("=" * 50)
 
     while not _stop_event.is_set():
-        # 等待 TTS 播放完成再录音（避免回声）
+        # ── 初始监听：检测唤醒词 ──
+        # 如果监控播报还在播放，等它结束
         if _tts_playing.is_set():
-            _stop_event.wait(2)
-            if _tts_playing.is_set():
-                tts_queue.wait_playing(timeout=60)
-            continue
+            tts_queue.wait_playing(timeout=60)
+            time.sleep(3)
 
-        # 录音
         wav = recorder.record_once()
         if not wav:
             continue
 
-        # ASR
         user_text = transcribe(wav)
         if not user_text:
+            time.sleep(3)
             continue
 
         print(f"\n听到: {user_text}")
 
-        # 唤醒词检测
         if not check_wake_word(user_text):
+            _play_quick_reply()
             continue
 
-        print("[VA] 唤醒成功!")
+        # ── 唤醒成功，进入 VA 会话 ──
+        _voice_busy.set()
+        print("[VA] 唤醒成功！进入会话")
 
-        # prewarm + 播放唤醒回复
+        # 后台预热 LLM
         prewarm()
+
+        # 播放唤醒回复（同步 TTS，内部设 _tts_playing）
         if WAKE_REPLY_PATH.exists():
             _play_wav_sync(WAKE_REPLY_PATH)
         else:
-            tts_queue.put(WAKE_REPLY, priority=2, tag="wake_reply")
-            tts_queue.wait_playing(timeout=30)
+            _tts_speak_now(WAKE_REPLY)
+        time.sleep(3)
 
-        # 提取指令
+        # 提取唤醒词后面的指令（如果有的话）
         command = extract_command(user_text)
-        if not command:
-            print(f"[VA] 请说指令（{COMMAND_TIMEOUT}s 内）...")
-            # 等待 TTS 播放完再录音
-            tts_queue.wait_playing(timeout=10)
-            recorder_cmd = MicRecorder(listen_timeout=COMMAND_TIMEOUT)
-            cmd_wav = recorder_cmd.record_once()
-            if not cmd_wav:
-                print("[VA] 超时，没有听到指令")
+
+        # ── 会话循环：监听 → ASR → LLM → TTS ──
+        while not _stop_event.is_set():
+            if command:
+                # 唤醒词后面直接跟了指令，跳过监听
+                pass
+            else:
+                # 监听用户提问（30s 超时）
+                print(f"[VA] 请说话（{SESSION_TIMEOUT}s 内）...")
+                wav = session_recorder.record_once()
+                if not wav:
+                    # 超时，没有声音
+                    print("[VA] 超时，没有听到声音")
+                    _tts_speak_now("再见")
+                    time.sleep(3)
+                    break
+
+                user_text = transcribe(wav)
+                if not user_text:
+                    # 有声音但 ASR 为空
+                    print("[VA] 没听清")
+                    _tts_speak_now("没听清，请再说一遍")
+                    time.sleep(3)
+                    command = None  # 继续监听
+                    continue
+
+                print(f"\n听到: {user_text}")
+                command = user_text
+
+                # 检测结束对话
+                if re.search(r'再见|拜拜|bye|走了|不聊了|先这样', command, re.IGNORECASE):
+                    print("[VA] 用户说再见，结束对话")
+                    _tts_speak_now("再见，有需要随时叫我")
+                    time.sleep(3)
+                    break
+
+            # 此时 command 有内容
+            print(f"你: {command}")
+
+            # 送 LLM
+            reply = chat(command,
+                         history=history if len(history) < 10 else history[-10:])
+            if not reply:
+                print("[VA] 思考失败")
+                _tts_speak_now("我思考了一下，但出了点问题")
+                time.sleep(3)
+                command = None  # 继续监听
                 continue
-            command = transcribe(cmd_wav)
-            if not command:
-                print("[VA] 没听清指令")
-                tts_queue.put("没听清，请再说一遍", priority=2, tag="retry")
-                tts_queue.wait_playing(timeout=30)
-                continue
 
-        print(f"你: {command}")
+            # 保存对话历史
+            history.append({"role": "user", "content": command})
+            history.append({"role": "assistant", "content": reply})
 
-        # LLM → TTS
-        reply = chat(command, history=history if len(history) < 10 else history[-10:])
-        if not reply:
-            print("[VA] 思考失败")
-            tts_queue.put("我思考了一下，但出了点问题", priority=2, tag="error")
-            tts_queue.wait_playing(timeout=30)
-            continue
+            # 播报 LLM 回复（同步 TTS）
+            print(f"助手: {reply}")
+            _tts_speak_now(reply)
+            time.sleep(3)
 
-        print(f"助手: {reply}")
-        tts_queue.put(reply, priority=2, tag="assistant")
-        tts_queue.wait_playing(timeout=120)
+            # 回到监听，等待下一个提问
+            command = None
+            print("\n" + "-" * 30)
 
-        history.append({"role": "user", "content": command})
-        history.append({"role": "assistant", "content": reply})
-        print("\n" + "-" * 30)
+        # ── 会话结束 ──
+        _voice_busy.clear()
+        print("[VA] 会话结束，回到监听")
 
 
 def _play_wav_sync(wav_path):
