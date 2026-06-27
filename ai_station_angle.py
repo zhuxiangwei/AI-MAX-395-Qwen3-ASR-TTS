@@ -1506,6 +1506,9 @@ def run_voice_assistant(tts_queue):
             # 此时 command 有内容
             print(f"你: {command}")
 
+            # 快速回复，表示收到
+            _play_quick_reply()
+
             # ASR→LLM 环节提示音
             _play_sound(SOUND_ASR_DONE)
 
