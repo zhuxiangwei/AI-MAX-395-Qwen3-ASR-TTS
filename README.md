@@ -10,16 +10,18 @@
 
 ```
 麦克风 (card 1 ALC245)
-  → VAD (RMS 能量阈值)
+  → VAD (RMS 能量阈值 500, 连续5帧过滤)
     → WAV (44100/2ch/S16_LE)
       → ASR (Qwen3-ASR-1.7B, port 12347)
-        → 识别文本
+        → 识别文本（严格过滤：无效/太短/无意义）
           → 唤醒词检测（"你好小智" / "小智你好"）
             → 播放唤醒回复 → 提取指令
-              → LLM (Router port 12345, 别名 358)
+              → 环节提示音 (sound_asr_done.wav)
+              → LLM (Router port 12345, 别名 278, 常驻)
                 → tool calling（6 个工具）
-                  → 回复文本
-                    → TTS (Qwen3-TTS 0.6B, port 12348)
+                  → 回复文本（结束词检测：再见/拜拜/bye/走了/不聊了/先这样）
+                    → 环节提示音 (sound_llm_done.wav)
+                    → TTS (Qwen3-TTS 0.6B, port 12348, 同步播放)
                       → WAV → aplay → 扬声器
 
 监控播报（独立线程，共享 TTS 队列）
@@ -113,9 +115,10 @@ python3 ai_station_angle.py --test-wake    # 测试唤醒词
 
 - 模型：Qwen3-TTS-12Hz-0.6B-CustomVoice（纯 CPU，port 12348）
 - 音色：vivian（中文女声）
-- 播放策略：非流式 WAV 播放（默认，优先稳定性）
+- 播放策略：同步 WAV 播放（`_tts_speak_now`，等播完才返回，优先稳定性）
 - 流式预缓冲模式保留（`TTS_USE_STREAM = True` 开关）
 - 固定种子 seed=42，确保同一文本音色一致
+- 播报完成后额外等待，防止扬声器回声被麦克风拾取
 
 ---
 
@@ -166,7 +169,7 @@ After=network.target qwen3-tts.service qwen3-asr.service llama-router.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/zxw/AI-MAX-395-Qwen3-ASR-TTS/ai_station_angle.py
+ExecStart=/usr/bin/python3 /home/zxw/scripts/ai_station_angle.py
 Restart=on-failure
 RestartSec=10
 
@@ -212,6 +215,7 @@ AI-MAX-395-Qwen3-ASR-TTS/
 - **播放设备**：`default`（card 1 ALC245 Analog 扬声器）
 - **ALSA 配置**：`/etc/asound.conf` 配置 dmix（播放共享）和 dsnoop（录音共享）
 - **音量**：ALSA Master 100%（alsactl store 持久化），TTS 不管理音量
+- **环节提示音**：`aplay -q -D default` 播放短 WAV，表示 ASR→LLM / LLM→TTS 环节切换
 
 ---
 
@@ -230,11 +234,20 @@ AI-MAX-395-Qwen3-ASR-TTS/
 
 程序内配置常量（位于 `ai_station_angle.py` 头部）：
 
-- `SILENCE_THRESHOLD`：VAD 能量阈值（默认 1000，建议 `--calibrate` 校准）
+- `SILENCE_THRESHOLD`：VAD 能量阈值（默认 500，建议 `--calibrate` 校准）
+- `VAD_CONSEC_FRAMES`：连续帧过滤（默认 5，过滤偶发尖峰噪音）
+- `SILENCE_DURATION_WAKE`：唤醒词录音静音超时（2.5s）
+- `SILENCE_DURATION_CMD`：指令录音静音超时（4.0s）
+- `ASR_MIN_VALID_LEN`：ASR 结果最小有效长度（≥2字）
 - `TTS_USE_STREAM`：流式 TTS 开关（默认 False）
+- `TTS_SPEAKER`：TTS 音色（默认 vivian）
+- `TTS_SEED`：TTS 固定种子（42，确保音色一致）
+- `TTS_QUEUE_MAX`：TTS 队列上限（3 条）
+- `COMMAND_TIMEOUT`：唤醒后等待指令超时（默认 15s）
+- `QUICK_REPLY_COOLDOWN`：quick_reply 冷却秒数（60s）
+- `LLM_MODEL`：LLM 模型别名（278，常驻不 sleep）
 - `FAST_POLL` / `SLOW_POLL`：监控轮询间隔
 - `GPU_TEMP_WARN` / `GPU_TEMP_CRIT`：告警阈值
-- `COMMAND_TIMEOUT`：唤醒后等待指令超时（默认 15s）
 
 ---
 
