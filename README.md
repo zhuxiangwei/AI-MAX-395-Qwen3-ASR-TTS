@@ -60,18 +60,21 @@ python3 ai_station_angle.py --test-wake    # 测试唤醒词
 ### 工作流程
 
 1. 持续监听麦克风，检测到语音后录音
-2. ASR 识别为文本
+2. ASR 识别为文本（严格过滤：无效输出、太短、无意义单字/语气词）
 3. 检查是否包含唤醒词（"你好小智" / "小智你好"）
-4. 命中唤醒词 → 后台预热 358 模型 → 播放唤醒回复
+4. 命中唤醒词 → 播放唤醒回复（278 常驻，无需预热）
 5. 提取唤醒词后的指令（无指令则再录一段）
-6. LLM 对话（支持 tool calling）→ TTS 语音输出
-7. TTS 播放期间麦克风暂停，避免回声
+6. 播放 ASR→LLM 环节提示音 → LLM 对话（支持 tool calling）
+7. 播放 LLM→TTS 环节提示音 → TTS 语音输出
+8. 检测到结束词（再见/拜拜/bye/走了/不聊了/先这样）→ TTS 回复 → 回到等待唤醒词状态
+9. TTS 播放期间麦克风暂停，避免回声
 
 ### 语音活动检测 (VAD)
 
-- 左声道 RMS 能量阈值检测
+- 左声道 RMS 能量阈值检测（默认 500，建议 `--calibrate` 校准）
 - 帧大小：30ms（1323 samples）
-- 静音超时：1.5s 自动停止
+- VAD 连续帧过滤：5 帧连续超阈值才算语音开始（过滤偶发尖峰噪音）
+- 静音超时：唤醒词 2.5s / 指令 4.0s 自动停止
 - 预语音缓冲：0.3s（防止截断开头）
 - 最大录音：30s，最小语音：0.3s
 - 监听超时：60s 无语音自动返回
@@ -82,14 +85,16 @@ python3 ai_station_angle.py --test-wake    # 测试唤醒词
 - 模型：Qwen3-ASR-1.7B-Q8_0（纯 CPU，port 12347）
 - 接口：OpenAI 兼容 `/v1/audio/transcriptions`
 - 输出格式：`<asr_text>` 标签解析
+- 严格过滤：无效输出模式匹配、最小长度检查（≥2字）、无意义单字/语气词过滤
 
 ### LLM 对话
 
-- 模型：Qwen3.6-35B-A3B（GPU，Router port 12345，别名 358）
+- 模型：Qwen3.6-27B（GPU，Router port 12345，别名 278）— 常驻不 sleep，无需预热
 - 参数：temperature=0.6, top_p=0.95, max_tokens=1024
 - 对话历史：最多保留最近 10 轮
-- Prewarm 机制：唤醒词触发后立即后台预热 358
+- Prewarm：278 常驻模式，无需预热
 - Tool Calling：最多 5 轮，防止死循环
+- 结束词检测：识别到"再见/拜拜/bye/走了/不聊了/先这样"后 TTS 回复并回到等待唤醒词状态
 
 ### 可用工具
 
@@ -187,7 +192,15 @@ WantedBy=default.target
 AI-MAX-395-Qwen3-ASR-TTS/
 ├── ai_station_angle.py    # 主程序（语音助手 + 监控播报合一）
 ├── assets/
-│   └── wake_reply.wav     # 唤醒回复预缓存音频
+│   ├── wake_reply.wav     # 唤醒回复预缓存音频
+│   ├── wake_reply.bak.wav # 唤醒回复备份
+│   ├── quick_reply_*.wav  # 随机简短回复（4个）
+│   ├── sound_asr_done.wav # ASR→LLM 环节提示音
+│   └── sound_llm_done.wav # LLM→TTS 环节提示音
+├── llama-router.sh        # Router 启动脚本
+├── qwen3-tts.sh           # TTS 启动脚本
+├── qwen3-asr.sh           # ASR 启动脚本
+├── hw-temp.sh             # 硬件温度监控脚本
 └── README.md
 ```
 

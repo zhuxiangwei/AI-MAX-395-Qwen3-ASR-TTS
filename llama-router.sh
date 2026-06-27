@@ -18,7 +18,7 @@ exec "$ROUTER" \
   --api-key 71769f2CeCE681015e1B71eCf848900e \
   -a Qwen3.6 \
   --models-dir /home/zxw/model \
-  --models-max 2 \
+  --models-max 1 \
   --models-preset /home/zxw/model/router-preset.ini \
   --metrics \
   >> "$LOGDIR/router.log" 2>&1

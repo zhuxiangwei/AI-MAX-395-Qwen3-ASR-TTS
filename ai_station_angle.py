@@ -87,7 +87,7 @@ SAMPLE_WIDTH = 2
 FRAME_MS = 30
 FRAME_SAMPLES = int(RATE * FRAME_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * CHANNELS * SAMPLE_WIDTH
-SILENCE_THRESHOLD = 2500
+SILENCE_THRESHOLD = 500
 VAD_CONSEC_FRAMES = 5  # 需要连续 N 帧超过阈值才算语音开始（过滤偶发尖峰噪音）
 SILENCE_DURATION_WAKE = 2.5   # 唤醒词录音：短停顿即截断（唤醒词本身短）
 SILENCE_DURATION_CMD = 4.0     # 指令录音：长停顿才截断（支持多句话一次说完）
@@ -110,6 +110,22 @@ QUICK_REPLY_FILES = [
 
 _quick_reply_last_time = 0  # 上次播放 quick_reply 的时间戳
 QUICK_REPLY_COOLDOWN = 60  # 冷却秒数，避免反复触发
+
+# --- 预生成提示音（不调 TTS，直接播放 WAV 表示工作状态）---
+SOUND_ASR_DONE = Path(__file__).parent / "assets" / "sound_asr_done.wav"      # ASR→LLM 环节提示
+SOUND_LLM_DONE = Path(__file__).parent / "assets" / "sound_llm_done.wav"      # LLM→TTS 环节提示
+
+def _play_sound(wav_path):
+    """播放短提示音（非 TTS），表示 ASR→LLM 或 LLM→TTS 环节切换。"""
+    if not wav_path.exists():
+        return
+    try:
+        subprocess.run(
+            ["aplay", "-q", "-D", "default", str(wav_path)],
+            check=True, capture_output=True, timeout=5,
+        )
+    except Exception as e:
+        print(f"[Sound] 播放失败: {e}")
 
 
 def _play_quick_reply():
@@ -183,7 +199,7 @@ COMMAND_TIMEOUT = 15
 ROUTER_HOST = "127.0.0.1"
 ROUTER_PORT = 12345
 ROUTER_API_KEY = "71769f2CeCE681015e1B71eCf848900e"
-LLM_MODEL = "Qwen3.6-35B-A3B-APEX-MTP-I-Balanced"
+LLM_MODEL = "278"
 MAX_TOOL_ROUNDS = 5
 
 # --- ASR ---
@@ -198,7 +214,19 @@ _ASR_INVALID_PATTERNS = [
     "transcribe audio to text",
     "transcribe audio a texto",
     "transcribe audio",
+    "以下是普通话",
+    "speech to text",
+    "语音转文字",
 ]
+
+# ASR 结果最小有效长度（单字或无意义短词直接丢弃）
+ASR_MIN_VALID_LEN = 2
+# ASR 无意义输出（单字/语气词）
+_ASR_MEANINGLESS = {
+    "嗯", "啊", "哦", "呃", "唉", "嗨", "哈", "嘿", "唔", "呀",
+    "呢", "吧", "吗", "嗯。", "啊。", "哦。", "嗯,", "啊,",
+    "hello", "hi", "ok", "yeah", "嗯嗯", "啊哈",
+}
 
 # --- 正则 ---
 ALERT_KEYWORDS = [
@@ -824,6 +852,14 @@ def transcribe(wav_path):
         if bad in text_lower:
             print(f"[ASR] 丢弃无效输出: {text}")
             return None
+    # 严格过滤无效 ASR 输出
+    text_stripped = text.strip().rstrip("。.,，！!？?")
+    if len(text_stripped) < ASR_MIN_VALID_LEN:
+        print(f"[ASR] 太短，丢弃: '{text}'")
+        return None
+    if text_stripped in _ASR_MEANINGLESS or text.lower().strip() in _ASR_MEANINGLESS:
+        print(f"[ASR] 无意义输出，丢弃: '{text}'")
+        return None
     print(f"[ASR] 识别: {text}")
     return text if text else None
 
@@ -1049,73 +1085,10 @@ _prewarm_thread = None
 
 
 def prewarm():
-    global _prewarm_done, _prewarm_thread
-    _prewarm_done = False
-    def _do_prewarm():
-        global _prewarm_done
-        try:
-            conn = http.client.HTTPConnection(ROUTER_HOST, ROUTER_PORT, timeout=5)
-            conn.request("GET", "/v1/models",
-                         headers={"Authorization": f"Bearer {ROUTER_API_KEY}"})
-            resp = conn.getresponse()
-            data = json.loads(resp.read().decode())
-            conn.close()
-            status = None
-            for m in data.get("data", []):
-                mid = m.get("id", "")
-                aliases = [a for a in m.get("aliases", [])]
-                if LLM_MODEL in aliases or LLM_MODEL == mid:
-                    status = m["status"]["value"]
-                    break
-            if status == "loaded":
-                print(f"[LLM] {LLM_MODEL} 已就绪")
-                _prewarm_done = True
-                return
-            print(f"[LLM] {LLM_MODEL} 状态={status}，触发加载...")
-            # 找对应模型的完整 ID
-            target_model = None
-            for m in data.get("data", []):
-                mid = m.get("id", "")
-                aliases = [a for a in m.get("aliases", [])]
-                if LLM_MODEL in aliases or LLM_MODEL == mid:
-                    target_model = mid
-                    break
-            if target_model is None:
-                print(f"[LLM] 未找到模型 {LLM_MODEL}，跳过预热")
-                _prewarm_done = True
-                return
-            conn = http.client.HTTPConnection(ROUTER_HOST, ROUTER_PORT, timeout=10)
-            conn.request("POST", "/models/load",
-                body=json.dumps({"model": target_model}),
-                headers={"Authorization": f"Bearer {ROUTER_API_KEY}",
-                         "Content-Type": "application/json"})
-            resp = conn.getresponse()
-            result = json.loads(resp.read().decode())
-            conn.close()
-            print(f"[LLM] /models/load: {result}")
-            for _ in range(60):
-                time.sleep(2)
-                conn = http.client.HTTPConnection(ROUTER_HOST, ROUTER_PORT, timeout=5)
-                conn.request("GET", "/v1/models",
-                             headers={"Authorization": f"Bearer {ROUTER_API_KEY}"})
-                resp = conn.getresponse()
-                data = json.loads(resp.read().decode())
-                conn.close()
-                for m in data.get("data", []):
-                    mid = m.get("id", "")
-                    aliases = [a for a in m.get("aliases", [])]
-                    if LLM_MODEL in aliases or LLM_MODEL == mid:
-                        if m["status"]["value"] == "loaded":
-                            print(f"[LLM] {LLM_MODEL} 加载完成")
-                            _prewarm_done = True
-                            return
-                        break
-            print(f"[LLM] {LLM_MODEL} 加载超时")
-        except Exception as e:
-            print(f"[LLM] 预热失败: {e}")
-        _prewarm_done = True
-    _prewarm_thread = threading.Thread(target=_do_prewarm, daemon=True)
-    _prewarm_thread.start()
+    """278 常驻不 sleep，无需预热。保留空函数兼容调用。"""
+    global _prewarm_done
+    _prewarm_done = True
+    print(f"[LLM] {LLM_MODEL} 常驻模式，无需预热")
 
 
 def chat(user_text, history=None):
@@ -1533,6 +1506,9 @@ def run_voice_assistant(tts_queue):
             # 此时 command 有内容
             print(f"你: {command}")
 
+            # ASR→LLM 环节提示音
+            _play_sound(SOUND_ASR_DONE)
+
             # 送 LLM
             reply = chat(command,
                          history=history if len(history) < 10 else history[-10:])
@@ -1546,6 +1522,9 @@ def run_voice_assistant(tts_queue):
             # 保存对话历史
             history.append({"role": "user", "content": command})
             history.append({"role": "assistant", "content": reply})
+
+            # LLM→TTS 环节提示音
+            _play_sound(SOUND_LLM_DONE)
 
             # 播报 LLM 回复（同步 TTS）
             print(f"助手: {reply}")
