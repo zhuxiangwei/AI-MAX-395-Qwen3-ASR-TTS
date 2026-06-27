@@ -1448,7 +1448,7 @@ def run_voice_assistant(tts_queue):
         print(f"\n听到: {user_text}")
 
         if not check_wake_word(user_text):
-            _play_quick_reply()
+            # 未命中唤醒词，静默继续监听
             continue
 
         # ── 唤醒成功，进入 VA 会话 ──
