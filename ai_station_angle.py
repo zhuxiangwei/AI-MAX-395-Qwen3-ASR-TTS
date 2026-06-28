@@ -99,6 +99,21 @@ LISTEN_TIMEOUT = 60
 WARMUP_FRAMES = 10
 OUTPUT_DIR = Path("/tmp/voice_assistant")
 
+def _cleanup_temp_recordings():
+    """启动时清理旧的临时录音文件"""
+    if OUTPUT_DIR.exists():
+        removed = 0
+        for f in OUTPUT_DIR.glob("rec_*.wav"):
+            try:
+                f.unlink()
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            print(f"[Mic] 清理 {removed} 个旧录音文件")
+
+_cleanup_temp_recordings()
+
 # --- 简短回复预录音（随机选一个播放）---
 QUICK_REPLY_FILES = [
     Path(__file__).parent / "assets" / "quick_reply_0.wav",
@@ -643,7 +658,7 @@ def compute_rms(data: bytes) -> float:
     return math.sqrt(total / count)
 
 
-# struct.unpack_from 加速
+# struct.unpack 加速
 import struct
 _struct_h = struct.Struct('<h')
 def struct_unpack_h(data, offset):
@@ -837,6 +852,12 @@ def transcribe(wav_path):
     except requests.exceptions.RequestException as e:
         print(f"[ASR] 请求失败: {e}")
         return None
+    finally:
+        # 录音文件已读取完毕，删除临时文件
+        try:
+            wav_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     if resp.status_code != 200:
         print(f"[ASR] HTTP {resp.status_code}: {resp.text}")
         return None
