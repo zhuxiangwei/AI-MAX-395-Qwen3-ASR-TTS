@@ -2,7 +2,7 @@
 
 运行在 AI 推理机上的语音交互与监控播报系统。单进程双线程架构：语音助手循环 + 硬件监控播报，共享 TTS 队列，TTS 播放时麦克风自动暂停防回声。
 
-> 模型基础部署见 [AI-MAX-395-Qwen3.6](https://github.com/yourname/AI-MAX-395-Qwen3.6) 项目（llama.cpp + Vulkan，Qwen3.6 27B/35B）。
+> 模型基础部署见 [AI-MAX-395-Qwen3.6](https://github.com/zhuxiangwei/AI-MAX-395-Qwen3.6) 项目（llama.cpp + Vulkan，Qwen3.6 27B/35B）。
 
 ---
 
