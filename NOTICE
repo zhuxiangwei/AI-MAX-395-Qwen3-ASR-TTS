@@ -1,0 +1,17 @@
+Third-Party Notices
+
+This repository contains deployment notes, configuration copies and benchmark
+data produced by running third-party models on local hardware. The MIT license
+in LICENSE covers only the original content authored by zhuxiangwei.
+
+Model weights are NOT distributed in this repository. Where model names,
+licenses or upstream workflows are referenced, their copyright and license
+terms remain with their respective owners, including but not limited to:
+
+- Tencent Hy4-Flash / Hy4 -- Tencent Hy License 1.0
+- Qwen model family -- Apache License 2.0 (see the upstream model card)
+- MiniMax H3 / FastH3 -- MiniMax H3 Community License Agreement
+- ComfyUI and official workflow JSON mirrors -- copyright Comfy-Org / upstream authors
+
+Referenced benchmarks and measurements are the author's own records of running
+these models; they do not grant any rights to the underlying weights.
